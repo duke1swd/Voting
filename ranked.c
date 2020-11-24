@@ -25,6 +25,7 @@ depends on whatever qsort happens to do
 #include <stdio.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <string.h>
 #define	MAX_CANDIDATES	50
 #define	MAX_VOTERS	10
 
@@ -505,6 +506,20 @@ compar(const void *p, const void *q)
 	return 1;
 }
 
+static int
+count_tied_majorities()
+{
+	int i, j;
+	int count;
+
+	count = 0;
+	for (i = 0; i < num_majorities - 1; i++)
+		for (j = i + 1; j < num_majorities; j++)
+			if (compar(majorities + i, majorities + j) == 0)
+				count++;
+	return count;
+}
+
 static void
 do_sort()
 {
@@ -867,6 +882,10 @@ main(int argc, char **argv)
 	pull_unranked_losers();
 	while (pull_condorcet())
 		;
+	printf("%d majorities and %d majority pairings remain.  %d majority ties were found.\n",
+		num_majorities,
+		num_majorities * (num_majorities - 1) / 2,
+		count_tied_majorities());
 	ranking_tie = 0;
 	while (num_majorities) {
 		do_sort();
