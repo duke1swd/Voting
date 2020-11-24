@@ -26,10 +26,13 @@ depends on whatever qsort happens to do
 #include <strings.h>
 #include <stdlib.h>
 #include <string.h>
+#include <getopt.h>
 #define	MAX_CANDIDATES	50
 #define	MAX_VOTERS	10
 
-int verbose = 0;
+int verbose;
+int debug;
+int numeric_mode;
 
 /*
  * Record string name of each candidate.
@@ -222,13 +225,13 @@ input()
  * Does some basic error checking.
  * Also sets the number of candidates, voters, and rankings.
  */
+static int icheck_errors;
 static void
-icheck()
+icheck1()
 {
-	int i, j;
-	int errors;
+	int i;
 
-	errors = 0;
+	icheck_errors = 0;
 
 	/*
 	 * Is there a gap in the candidate list?
@@ -244,9 +247,15 @@ icheck()
 		if (candidates[i].name) {
 			fprintf(stderr, "%s: found a blank candidate.\n",
 				myname);
-			errors++;
+			icheck_errors++;
 			break;
 		}
+}
+
+static void
+icheck2()
+{
+	int i, j;
 
 	/*
 	 * Is there a gap in any of the voters rankings?
@@ -262,7 +271,7 @@ icheck()
 			if (sr[i][j]) {
 				fprintf(stderr, "%s: gap in voter %d rankings\n",
 					myname, i);
-				errors++;
+				icheck_errors++;
 			}
 	}
 
@@ -274,10 +283,71 @@ icheck()
 		if (num_rankings[i]) {
 			fprintf(stderr, "%s: found a blank voter column\n",
 				myname);
-			errors++;
+			icheck_errors++;
 		}
 
-	if (errors) {
+	if (icheck_errors) {
+		fprintf(stderr, "%s: exiting on il-formed matrix\n",
+			myname);
+		exit(1);
+	}
+} 
+
+static void
+ncheck2()
+{
+	int i, j, t;
+	char tbuf[128];
+
+	/*
+	 * Did any voter give a rank < 1 or > number of candidates?
+	 * Or a rank that isn't an integer?
+	 */
+	memset(num_rankings, '\0', sizeof num_rankings);
+	for (i = 0; i < MAX_VOTERS; i++) {
+		num_rankings[i] = num_candidates;
+		for (j = 0; j < MAX_CANDIDATES-1; j++) 
+			if (sr[i][j]) {
+				t = atoi(sr[i][j]);
+				sprintf(tbuf, "%d", t);
+				if (strcmp(tbuf, sr[i][j]) != 0) {
+					fprintf(stderr, "%s: voter %i row %d is not an integer (%s)\n",
+							myname, i, j, sr[i][j]);
+					icheck_errors++;
+				}
+				if (t < 1 || t > num_candidates) {
+					fprintf(stderr, "%s: votor %i gave rank %d to candidate %d outside range [1-%d]\n",
+							myname, i, t, j, num_candidates);
+					icheck_errors++;
+				}
+
+				if (j >= num_candidates) {
+					fprintf(stderr, "%s: votor %i gave a rank to an unknown candidate (%d)\n",
+							myname, i, j);
+					icheck_errors++;
+				}
+			}
+
+	}
+}
+
+static void
+icheck3()
+{
+	int i;
+
+	for (i = 0; i < MAX_VOTERS - 1; i++)
+		if (num_rankings[i] == 0)
+			break;
+	num_voters = i;
+	for (i++; i < MAX_VOTERS; i++)
+		if (num_rankings[i]) {
+			fprintf(stderr, "%s: found a blank voter column\n",
+				myname);
+			icheck_errors++;
+		}
+
+	if (icheck_errors) {
 		fprintf(stderr, "%s: exiting on il-formed matrix\n",
 			myname);
 		exit(1);
@@ -287,6 +357,16 @@ icheck()
 /*
  * Debugging routine.
  */
+static void
+print_num_rankings()
+{
+	int i;
+
+	printf("Num Rankings:\n");
+	for (i = 0; i < num_voters; i++)
+		printf("\tv %2d: %d\n", i, num_rankings[i]);
+}
+
 static void
 print_sr_array()
 {
@@ -342,6 +422,23 @@ iconv()
 	}
 	if (errors)
 		exit(1);
+}
+
+/*
+ * Converts the string matrix into the integer matrix.
+ * This version assumes the string matrix contains rankings, rather than names
+ */
+static void
+nconv()
+{
+	int i, j;
+
+	memset(rankings, '\0', sizeof rankings);
+
+	for (i = 0; i < num_voters; i++) 
+		for (j = 0; j < num_rankings[i]; j++)
+			if (sr[i][j])
+				rankings[i][j] = atoi(sr[i][j]);
 }
 
 /*
@@ -852,18 +949,95 @@ print_majorities()
 }
 
 static void
+set_defaults() {
+	debug = 0;
+	verbose = 0;
+	numeric_mode = 0;
+}
+
+static void
 usage()
 {
-	fprintf(stderr, "Usage: %s <input\n", myname);
+	set_defaults();
+	fprintf(stderr, "Usage: %s [options] <input\n", myname);
+	fprintf(stderr, "Options:\n");
+	fprintf(stderr, "\t-v <verbose mode>\n");
+	fprintf(stderr, "\t-d <debugging>\n");
+	fprintf(stderr, "\t-n <numeric input mode.  See long help.>\n");
+	fprintf(stderr, "\t-h <print long help and exit>\n");
+	exit(1);
+}
+
+/*
+ * Long help.
+ * Describes input file format and exits
+ */
+static void
+long_help()
+{
+	char *msg = 
+	"\n"
+	"    The input file is a comma-separated-values data file (.csv)\n"
+	"    The first line is a header.  The first value in the header line\n"
+	"    should be \"candidates\".  Each subsequent value in the header\n"
+	"    is the name or ID of a voter.  The header line is ignored.\n"
+	"\n"
+	"    In normal mode, the first column in the rest of the\n"
+	"    file is a list of the candidates, in no particular order.\n"
+	"    Each column after that contains the candidates in the order\n"
+	"    ranked by that voter.  The voter need not rank all candidates.\n"
+	"    Any candidate not ranked is tied for last place by that voter.\n"
+	"    There is no way to represent ties.\n"
+	"\n"
+	"    In numeric mode (-n), the first column in the rest of the\n"
+	"    file is a list of the candidates, in no particular order.\n"
+	"    The rest of the columns contain integers.  The integer in\n"
+	"    column X row Y is the rank given by voter in column X to the\n"
+	"    candidate in column Y.	Ties, gaps, etc are possible.\n";
+
+	fprintf(stderr, "%s: Long help:\n", myname);
+	fputs(msg, stderr);
 	exit(1);
 }
 
 static void
 grok_args(int argc, char **argv)
 {
+	int c;
+	int errors;
+	int nargs;
+
 	myname = *argv;
 
-	if (argc != 1)
+	set_defaults();
+	errors = 0;
+
+	while ((c = getopt(argc, argv, "vhdn")) != EOF)
+		switch(c) {
+			case 'v':
+				verbose++;
+				break;
+			case 'd':
+				debug++;
+				break;
+			case 'n':
+				numeric_mode++;
+				break;
+			case 'h':
+				long_help();
+				break;
+			case '?':
+			default:
+				usage();
+		}
+
+	nargs = argc - optind;
+	if (nargs > 0) {
+		fprintf(stderr, "%s: no positional arguments\n", myname);
+		errors++;
+	}
+
+	if (errors)
 		usage();
 }
 
@@ -872,12 +1046,35 @@ main(int argc, char **argv)
 {
 	grok_args(argc, argv);
 	input();
-	icheck();
+	if (debug)
+		print_sr_array();
+	icheck1();
+	if (numeric_mode)
+		ncheck2();
+	else
+		icheck2();
+	icheck3();
+	if (debug)
+		print_num_rankings();
+
 	if (verbose)
 		printf("%d candidates and %d voters found.\n",
 			num_candidates, num_voters);
-	iconv();
+
+	if (numeric_mode)
+		nconv();
+	else
+		iconv();
+
+	if (debug)
+		print_ranking_array();
+
 	create_majorities();
+	if (debug) {
+		check_majorities("after creating them");
+		if (debug > 1)
+			print_majorities();
+	}
 	ranking_phase = 0;
 	pull_unranked_losers();
 	while (pull_condorcet())
