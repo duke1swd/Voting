@@ -28,6 +28,8 @@ depends on whatever qsort happens to do
 #define	MAX_CANDIDATES	50
 #define	MAX_VOTERS	10
 
+int verbose = 0;
+
 /*
  * Record string name of each candidate.
  */
@@ -35,7 +37,18 @@ depends on whatever qsort happens to do
 #define	RANKING_C_LOSER		2
 #define	RANKING_T_WINNER	3
 #define	RANKING_T_LOSER		4
-#define	RANKING_TIE		5
+#define	RANKING_LOSER		5
+#define	RANKING_NONE		6
+
+char *ranking_source_names[] = {
+	"NULL",
+	"Condorcet Winner",
+	"Condorcet Loser",
+	"Ranked Pairs Winner",
+	"Ranked Pairs Loser",
+	"No Rankings",
+	"No Algorithm",
+};
 
 int num_candidates;
 int next_winner;
@@ -43,10 +56,15 @@ int next_loser;
 struct candidate_s {
 	char *name;
 	int ranking;
+	int ranking_phase;
 	int ranking_source;
 	int wins_pair;
 	int loses_pair;
+	int ties;
 } candidates[MAX_CANDIDATES];
+
+int ranking_phase;
+int ranking_tie;
 
 /*
  * rankings[i][j] records rank voter i gave to candidate j.
@@ -220,7 +238,7 @@ icheck()
 		if (!candidates[i].name)
 			break;
 	num_candidates = i;
-	next_loser = i;
+	next_loser = i - 1;
 	for (i++; i < MAX_CANDIDATES; i++)
 		if (candidates[i].name) {
 			fprintf(stderr, "%s: found a blank candidate.\n",
@@ -373,7 +391,6 @@ create_majorities()
 	 * For this majority record this voter's preference.
 	 */
 	num_majorities = num_candidates * (num_candidates - 1) / 2;
-/*xxx*/if (mp - majorities != num_majorities) {fprintf(stderr, "GACK!\n"); exit(1);}
 	for (i = 0, mp = majorities; i < num_majorities; i++, mp++)
 		for (j = 0; j < num_voters; j++) {
 			r1 = rankings[j][mp->c1];
@@ -404,14 +421,32 @@ create_majorities()
 			mp->c2 = t;
 			mp->strength = -mp->strength;
 		}
-	if (j)
+	if (j && verbose)
 		printf("Warning: %d ties were found.\n", j);
+}
+
+/* DEBUGGING ROUTINE */
+static void
+check_majorities(char *s)
+{
+	int i;
+	struct majority_s *mp;
+
+	fprintf(stderr, "checking majorities: %s\n", s);
+	for (i = 0, mp = majorities; i < num_majorities; i++, mp++)
+		if (mp->c1 == mp->c2) {
+			fprintf(stderr, "majority %d is bad (%d)\n",
+				i, mp->c1);
+			exit(1);
+		}
 }
 
 /* 
  * return 0 if cannot figure out two majorities
  * return -1 if first majority is more important than second.
  * return 1 if second majority is more important than first
+ *
+ * Record if we ever returned 0.
  */
 static int
 compar(const void *p, const void *q)
@@ -436,8 +471,10 @@ compar(const void *p, const void *q)
 	/*
 	 * Call it a tie if both won against the same loser
 	 */
-	if (lp == lq)
+	if (lp == lq) {
+		ranking_tie = 1;
 		return 0;
+	}
 	
 	/*
 	 * Find the race that was between the losers.
@@ -455,8 +492,10 @@ compar(const void *p, const void *q)
 	/*
 	 * If the losers tied, then we are tied.
 	 */
-	if (mr->strength == 0)
+	if (mr->strength == 0) {
+		ranking_tie = 1;
 		return 0;
+	}
 
 	/*
 	 * P wins if Q's loser beats P's loser.
@@ -489,7 +528,6 @@ remove_pairings(struct candidate_s *cp)
 	struct majority_s *mp;
 
 	c = cp - candidates;
-/*xxx*/printf("Pulling pairings for candidate %d (%s)\n", c, cp->name);
 
 	n = 0;
 	for (i = 0, mp = majorities; i < num_majorities; i++, mp++)
@@ -502,7 +540,42 @@ remove_pairings(struct candidate_s *cp)
 	// sort the dead ones to the end.
 	qsort(majorities, num_majorities, sizeof majorities[0], remove_m);
 	num_majorities -= n;
-/*xxx*/printf("pulled %d pairings\n", n);
+}
+
+static void
+pull_unranked_losers()
+{
+	int i, j;
+	int count;
+	struct candidate_s *cp;
+
+	count = 0;
+	// loop over all canidates not already ranked.
+	for (i = 0, cp = candidates; i < num_candidates; i++, cp++)
+		if (!cp->ranking_source) {
+			// look to see if any voter gave this candidate a rank.
+			for (j = 0; j < num_voters; j++)
+				if (rankings[j][i])
+					break;
+			if (j >= num_voters) {
+				// candidate was unranked
+				cp->ranking_source = RANKING_LOSER;
+				cp->ranking_phase = ranking_phase;
+				count++;
+			}
+		}
+	
+	// loop over all candidates give the RANKING_LOSER status
+	if (count) {
+		next_loser -= count - 1;
+		for (i = 0, cp = candidates; i < num_candidates; i++, cp++)
+			if (cp->ranking_source == RANKING_LOSER) {
+				cp->ranking = next_loser;
+				remove_pairings(cp);
+			}
+		next_loser--;
+		ranking_phase++;
+	}
 }
 
 /*
@@ -523,20 +596,24 @@ pull_condorcet()
 	for (i = 0, cp = candidates; i < num_candidates; i++, cp++) {
 		cp->wins_pair = 0;
 		cp->loses_pair = 0;
+		cp->ties = 0;
 	}
 
-	for (i = 0, mp = majorities; i < num_majorities; i++, mp++) {
-		if (mp->strength == 0)
-			continue;
-		candidates[mp->c1].wins_pair = 1;
-		candidates[mp->c2].loses_pair = 1;
-	}
+	for (i = 0, mp = majorities; i < num_majorities; i++, mp++)
+		if (mp->strength) {
+			candidates[mp->c1].wins_pair = 1;
+			candidates[mp->c2].loses_pair = 1;
+		} else {
+			candidates[mp->c1].ties = 1;
+			candidates[mp->c2].ties = 1;
+		}
+			
 
 	// how many only win, never lose?
 	count = 0;
 	wp = NULL;
 	for (i = 0, cp = candidates; i < num_candidates; i++, cp++)
-		if (cp->wins_pair && !cp->loses_pair) {
+		if (cp->wins_pair && !cp->loses_pair && !cp->ties) {
 			count++;
 			wp = cp;
 		}
@@ -545,6 +622,7 @@ pull_condorcet()
 	if (count == 1) {
 		wp->ranking = next_winner++;
 		wp->ranking_source = RANKING_C_WINNER;
+		wp->ranking_phase = ranking_phase;
 	} else
 		wp = NULL;
 
@@ -552,7 +630,7 @@ pull_condorcet()
 	count = 0;
 	lp = NULL;
 	for (i = 0, cp = candidates; i < num_candidates; i++, cp++)
-		if (!cp->wins_pair && cp->loses_pair) {
+		if (!cp->wins_pair && cp->loses_pair && cp->ties) {
 			count++;
 			lp = cp;
 		}
@@ -561,6 +639,7 @@ pull_condorcet()
 	if (count == 1) {
 		lp->ranking = next_loser--;
 		lp->ranking_source = RANKING_C_LOSER;
+		lp->ranking_phase = ranking_phase;
 	} else
 		lp = NULL;
 
@@ -573,6 +652,8 @@ pull_condorcet()
 		remove_pairings(lp);
 		count++;
 	}
+	if (wp || lp)
+		ranking_phase++;
 	return count;
 }
 
@@ -600,10 +681,10 @@ path_to(int c1, int c2)
 	// is there a path from c2 to c1?
 	for (i = 0, mp = majorities; i < num_majorities; i++, mp++)
 		if (mp->locked && mp->c1 == c2) 
-			// is there a path
-			if (path_to(mp->c2, c1))
+			// there is an arc from c2 to mp->c2.
+			// is there a path from mp->c2 to c1?
+			if (path_to(c1, mp->c2))
 				return 1;
-	
 	return 0;
 }
 
@@ -626,8 +707,9 @@ do_lock()
 		else
 			not_locked++;
 	}
-	printf("%d pairings were locked, %d were not locked.\n",
-		num_majorities - not_locked, not_locked);
+	if (verbose)
+		printf("%d pairings were locked, %d were not locked.\n",
+			num_majorities - not_locked, not_locked);
 }
 
 /*
@@ -639,6 +721,7 @@ find_rp_winners()
 	int i;
 	int count;
 	struct majority_s *mp;
+	struct candidate_s *cp;
 	int is_not_winner[MAX_CANDIDATES];
 	int mentioned[MAX_CANDIDATES];
 
@@ -653,24 +736,85 @@ find_rp_winners()
 	}
 
 	count = 0;
-	for (i = 0; i < num_candidates; i++)
+	for (i = 0, cp = candidates; i < num_candidates; i++, cp++)
 		if (mentioned[i] && !is_not_winner[i]) {
 			count++;
-			candidates[i].ranking = next_winner;
-			candidates[i].ranking_source = RANKING_T_WINNER;
+			cp->ranking = next_winner;
+			cp->ranking_source = RANKING_T_WINNER;
+			cp->ranking_phase = ranking_phase;
+			remove_pairings(cp);
 		}
 	next_winner += count;
-	printf("Ranked pairs yielded %d winners\n", count);
+	if (verbose)
+		printf("Ranked pairs yielded %d winners at phase %d\n", count, ranking_phase+1);
+	if (count)
+		ranking_phase++;
+}
+
+/*
+ * Sort the candidates and print them out.
+ */
+static int
+rank_order(const void *p, const void *q)
+{
+	const struct candidate_s *cp = p;
+	const struct candidate_s *cq = q;
+
+	return cp->ranking - cq->ranking;
 }
 
 static void
 print_rankings()
 {
 	int i;
+	int count;
+	int source;
+	int ranking_tie_phase;
+	char flag;
 	struct candidate_s *cp;
 
+	source = RANKING_NONE;
+	count = 0;
 	for (i = 0, cp = candidates; i < num_candidates; i++, cp++) {
-		printf("%10s %3d %d\n", cp->name, cp->ranking, cp->ranking_source);
+		if (ranking_tie_phase < 0 && cp->ranking_source == RANKING_T_WINNER)
+			ranking_tie_phase = cp->ranking_phase;
+		if (!cp->ranking_source)
+			count++;
+	}
+	if (count == 1)
+		source = RANKING_T_LOSER;
+
+	printf("\n Name     Rank Phase Ranking Source\n");
+
+	// all candidates not yet ranked are tied for middle.
+	for (i = 0, cp = candidates; i < num_candidates; i++, cp++) {
+		if (!cp->ranking_source) {
+			cp->ranking_source = source;
+			cp->ranking = next_winner;
+			cp->ranking_phase = ranking_phase;
+		}
+	}
+
+	qsort(candidates, num_candidates, sizeof candidates[0], rank_order);
+
+	ranking_tie_phase = -1;
+	if (ranking_tie)
+		for (i = 0, cp = candidates; i < num_candidates; i++, cp++)
+			if (cp->ranking_source == RANKING_T_WINNER) {
+				ranking_tie_phase = cp->ranking_phase;
+				break;
+			}
+
+	for (i = 0, cp = candidates; i < num_candidates; i++, cp++) {
+		flag = ' ';
+		if (ranking_tie_phase >= 0 && cp->ranking_phase >= ranking_tie_phase)
+			flag = '*';
+		printf("%10s %3d%c %4d  %s\n",
+			cp->name,
+			cp->ranking + 1,
+			flag,
+			cp->ranking_phase + 1,
+			ranking_source_names[cp->ranking_source]);
 	}
 }
 
@@ -714,14 +858,22 @@ main(int argc, char **argv)
 	grok_args(argc, argv);
 	input();
 	icheck();
-	printf("%d candidates and %d voters found.\n",
-		num_candidates, num_voters);
+	if (verbose)
+		printf("%d candidates and %d voters found.\n",
+			num_candidates, num_voters);
 	iconv();
 	create_majorities();
+	ranking_phase = 0;
+	pull_unranked_losers();
 	while (pull_condorcet())
 		;
-	do_sort();
-	do_lock();
-	find_rp_winners();
+	ranking_tie = 0;
+	while (num_majorities) {
+		do_sort();
+		do_lock();
+		find_rp_winners();
+	}
+	if (ranking_tie)
+		printf("Ranking ties were found.  RP ranking is not unique.\n");
 	print_rankings();
 }
